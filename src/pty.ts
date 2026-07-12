@@ -7,7 +7,6 @@
  */
 
 import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
-import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 
 import { IS_WINDOWS, resolveBinary } from "./shell.ts";
@@ -79,6 +78,41 @@ type PtyProcess = {
 	kill: (signal?: string) => void;
 };
 
+type BunTerminal = {
+	write(data: Uint8Array): number;
+	resize(cols: number, rows: number): void;
+	close(): void;
+};
+
+type BunSubprocess = {
+	pid: number;
+	kill(signal?: NodeJS.Signals): void;
+};
+
+type BunRuntime = {
+	Terminal: new (options: {
+		name?: string;
+		cols: number;
+		rows: number;
+		data(terminal: BunTerminal, data: Uint8Array): void;
+	}) => BunTerminal;
+	spawn(
+		command: string[],
+		options: {
+			cwd: string;
+			env: NodeJS.ProcessEnv;
+			terminal: BunTerminal;
+			detached?: boolean;
+			onExit(
+				process: BunSubprocess,
+				exitCode: number | null,
+				signalCode: number | NodeJS.Signals | null,
+				error?: Error,
+			): void;
+		},
+	): BunSubprocess;
+};
+
 /**
  * PTY provider package. The @homebridge fork of node-pty-prebuilt-multiarch
  * ships win32 prebuilds (conpty/winpty) in addition to linux/macOS. Loaded
@@ -88,30 +122,35 @@ type PtyProcess = {
  */
 const PTY_PACKAGE = "@homebridge/node-pty-prebuilt-multiarch";
 
-let ptyModule: PtyModule | null | undefined;
+const bunRuntime = (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
+let ptyModule: PtyModule | null = null;
 let ptyLoadError: string | undefined;
 
+if (bunRuntime && !bunRuntime.Terminal) {
+	ptyLoadError = "Bun.Terminal is unavailable; Bun 1.3.5 or newer is required for tty: true";
+} else if (!bunRuntime) {
+	try {
+		// Keep this as a literal dynamic import so Pi's jiti package loader resolves
+		// the optional dependency within this package's isolated module root. A
+		// createRequire(import.meta.url) call bypasses that resolver and cannot find
+		// npm-hoisted or pnpm-linked dependencies when Pi loads the extension.
+		const imported = (await import("@homebridge/node-pty-prebuilt-multiarch")) as unknown as Partial<PtyModule> & {
+			default?: PtyModule;
+		};
+		const loaded = typeof imported.spawn === "function" ? (imported as PtyModule) : imported.default;
+		if (!loaded) throw new Error("module has no spawn export");
+		ptyModule = loaded;
+	} catch (err: any) {
+		ptyLoadError = `${PTY_PACKAGE}: ${err?.message ?? err}`;
+	}
+}
+
 export function getPtyLoadError(): string | undefined {
-	loadPty();
 	return ptyLoadError;
 }
 
 export function isPtyAvailable(): boolean {
-	loadPty();
-	return !!ptyModule;
-}
-
-function loadPty(): void {
-	if (ptyModule !== undefined) return; // already attempted
-	try {
-		// Use createRequire so CJS-only native modules work under ESM + jiti.
-		const req = createRequire(import.meta.url);
-		ptyModule = req(PTY_PACKAGE) as PtyModule;
-		ptyLoadError = undefined;
-	} catch (err: any) {
-		ptyModule = null;
-		ptyLoadError = `${PTY_PACKAGE}: ${err?.message ?? err}`;
-	}
+	return !!bunRuntime?.Terminal || !!ptyModule;
 }
 
 // Numeric signal → name, built from the platform's full signal table so our
@@ -185,20 +224,147 @@ export function disposeWindowsConpty(child: unknown): void {
 /** Spawn a child with PTY or pipes. Throws if PTY requested but unavailable. */
 export function spawnChild(opts: SpawnOptions): SpawnedChild {
 	if (opts.tty) {
-		loadPty();
-		if (!ptyModule) {
-			throw new Error(
-				`tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +
-					`Install it with:  cd .pi/extensions/unified-exec && npm install\n` +
-					`Or call with tty: false to use pipes instead.`,
-			);
-		}
-		return spawnPty(ptyModule, opts);
+		if (bunRuntime?.Terminal) return spawnBunPty(bunRuntime, opts);
+		if (ptyModule) return spawnPty(ptyModule, opts);
+		throw new Error(
+			`tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +
+				`Install it with:  cd .pi/extensions/unified-exec && npm install\n` +
+				`Or call with tty: false to use pipes instead.`,
+		);
 	}
 	return spawnPipes(opts);
 }
 
 // ---------------- PTY impl ----------------
+
+function spawnBunPty(bun: BunRuntime, opts: SpawnOptions): SpawnedChild {
+	if (!opts.command[0]) throw new Error("spawnChild: empty command");
+	const dataHandlers = new Set<(chunk: Uint8Array) => void>();
+	const exitHandlers = new Set<ExitCallback>();
+	let exited = false;
+
+	const terminal = new bun.Terminal({
+		name: "xterm-256color",
+		cols: opts.cols ?? 120,
+		rows: opts.rows ?? 30,
+		data(_terminal, data) {
+			for (const handler of dataHandlers) {
+				try {
+					handler(data);
+				} catch {
+					// ignore handler errors
+				}
+			}
+		},
+	});
+	let command = opts.command;
+	if (IS_WINDOWS && opts.windowsVerbatimArguments) {
+		// buildShellCommand pre-quotes cmd.exe's /c payload for node-pty's raw
+		// command-line mode. Bun.spawn accepts argv and performs its own quoting,
+		// so passing those wrapper quotes would make them part of the command.
+		const last = command.at(-1);
+		if (last?.startsWith('"') && last.endsWith('"')) {
+			command = [...command.slice(0, -1), last.slice(1, -1)];
+		}
+	}
+	const child = bun.spawn(command, {
+		cwd: opts.cwd,
+		env: opts.env,
+		terminal,
+		// Bun.Terminal does not currently make the PTY the controlling terminal,
+		// so its line discipline cannot deliver Ctrl-C to a foreground process
+		// group. Give the child its own group and emulate that delivery in write().
+		detached: !IS_WINDOWS,
+		onExit(_process, exitCode, signalCode, error) {
+			if (exited) return;
+			exited = true;
+			const signal =
+				typeof signalCode === "string"
+					? signalCode
+					: signalCode != null
+						? signalNameFromNumber(signalCode)
+						: null;
+			for (const handler of exitHandlers) {
+				try {
+					handler(signal ? null : exitCode, signal, error?.message);
+				} catch {
+					// ignore handler errors
+				}
+			}
+			exitHandlers.clear();
+			dataHandlers.clear();
+			try {
+				terminal.close();
+			} catch {
+				// already closed
+			}
+		},
+	});
+
+	return {
+		pid: child.pid,
+		tty: true,
+		write(data) {
+			if (exited) return false;
+			try {
+				if (!IS_WINDOWS) {
+					// Bun.Terminal currently lacks a foreground process group, so the
+					// kernel cannot translate the default VINTR/VQUIT bytes into signals.
+					// Bridge the safe terminating signals; leave EOF, suspend, flow
+					// control, and editing bytes to the terminal line discipline.
+					const signals: NodeJS.Signals[] = [];
+					if (data.includes(0x03)) signals.push("SIGINT"); // Ctrl-C / VINTR
+					if (data.includes(0x1c)) signals.push("SIGQUIT"); // Ctrl-\\ / VQUIT
+					const remaining = data.filter((byte) => byte !== 0x03 && byte !== 0x1c);
+					if (remaining.length > 0) terminal.write(remaining);
+					for (const signal of signals) {
+						try {
+							process.kill(-child.pid, signal);
+						} catch {
+							child.kill(signal);
+						}
+					}
+				} else {
+					terminal.write(data);
+				}
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		onData(handler) {
+			dataHandlers.add(handler);
+			return () => dataHandlers.delete(handler);
+		},
+		onExit(handler) {
+			if (!exited) exitHandlers.add(handler);
+		},
+		kill(signal = "SIGTERM") {
+			if (exited) return;
+			try {
+				if (IS_WINDOWS) child.kill(signal);
+				else process.kill(-child.pid, signal);
+			} catch {
+				try {
+					child.kill(signal);
+				} catch {
+					// already gone
+				}
+			}
+		},
+		resize(cols, rows) {
+			if (exited) return;
+			try {
+				terminal.resize(cols, rows);
+				// Without a foreground process group Bun.Terminal may update the PTY
+				// dimensions without delivering the corresponding SIGWINCH.
+				if (!IS_WINDOWS) process.kill(-child.pid, "SIGWINCH");
+			} catch {
+				// ignore
+			}
+		},
+	};
+}
 
 function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 	let [file, ...args] = opts.command;

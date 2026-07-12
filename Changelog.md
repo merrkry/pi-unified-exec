@@ -2,6 +2,13 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## Unreleased
+
+### Fixed
+
+- Use Bun's native `Bun.Terminal` PTY backend when the extension runs inside a standalone Bun-based Pi executable. Loading the Node native addon under Bun succeeded superficially but produced no data and exited with `SIGHUP`. The Bun backend creates a detached process group and compensates for Bun.Terminal not yet assigning the PTY as the child's controlling terminal by bridging Ctrl-C/Ctrl-\\ to `SIGINT`/`SIGQUIT` and delivering `SIGWINCH` after resize; Ctrl-D and other line-discipline input remain untouched. On Windows it also converts the pre-quoted cmd.exe payload back to argv form for `Bun.spawn`. Bun runtimes older than 1.3.5 now report a clear unsupported-version error instead of falling back to the incompatible Node addon.
+- Load the optional Node PTY provider through a literal dynamic import so Pi's jiti package resolver can find it within an isolated package module root. The previous `createRequire(import.meta.url)` path bypassed Pi's resolver and reported the provider missing even when npm or pnpm had installed it successfully.
+
 ## 2026-07-10 — 0.6.1
 
 ### Added
