@@ -2,6 +2,16 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## Unreleased
+
+### Fixed
+
+- Load the optional Node PTY provider through a literal dynamic import so Pi's jiti package resolver can find npm-hoisted and pnpm-linked installations within an isolated package module root.
+
+### Changed
+
+- Fail extension loading with a clear diagnostic under Bun instead of loading a Node native addon that may appear to initialize but produces no PTY data or exits with `SIGHUP`. This temporary production branch requires Node.js 22.19 or newer.
+
 ## 2026-07-10 — 0.6.1
 
 ### Added

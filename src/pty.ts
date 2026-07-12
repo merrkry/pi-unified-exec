@@ -7,7 +7,6 @@
  */
 
 import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
-import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 
 import { IS_WINDOWS, resolveBinary } from "./shell.ts";
@@ -88,30 +87,38 @@ type PtyProcess = {
  */
 const PTY_PACKAGE = "@homebridge/node-pty-prebuilt-multiarch";
 
-let ptyModule: PtyModule | null | undefined;
+const bunVersion = process.versions.bun;
+if (bunVersion) {
+	throw new Error(
+		`pi-unified-exec: Bun runtime ${bunVersion} is unsupported because node-pty is not reliable under Bun. Run Pi with Node.js 22.19 or newer.`,
+	);
+}
+
+let ptyModule: PtyModule | null;
 let ptyLoadError: string | undefined;
 
+try {
+	// Keep this as a literal dynamic import so Pi's jiti package loader resolves
+	// the optional dependency within this package's isolated module root. A
+	// createRequire(import.meta.url) call bypasses that resolver and can report
+	// the npm-hoisted or pnpm-linked dependency as missing.
+	const imported = (await import("@homebridge/node-pty-prebuilt-multiarch")) as unknown as Partial<PtyModule> & {
+		default?: PtyModule;
+	};
+	const loaded = typeof imported.spawn === "function" ? (imported as PtyModule) : imported.default;
+	if (!loaded) throw new Error("module has no spawn export");
+	ptyModule = loaded;
+} catch (err: any) {
+	ptyModule = null;
+	ptyLoadError = `${PTY_PACKAGE}: ${err?.message ?? err}`;
+}
+
 export function getPtyLoadError(): string | undefined {
-	loadPty();
 	return ptyLoadError;
 }
 
 export function isPtyAvailable(): boolean {
-	loadPty();
 	return !!ptyModule;
-}
-
-function loadPty(): void {
-	if (ptyModule !== undefined) return; // already attempted
-	try {
-		// Use createRequire so CJS-only native modules work under ESM + jiti.
-		const req = createRequire(import.meta.url);
-		ptyModule = req(PTY_PACKAGE) as PtyModule;
-		ptyLoadError = undefined;
-	} catch (err: any) {
-		ptyModule = null;
-		ptyLoadError = `${PTY_PACKAGE}: ${err?.message ?? err}`;
-	}
 }
 
 // Numeric signal → name, built from the platform's full signal table so our
@@ -185,7 +192,6 @@ export function disposeWindowsConpty(child: unknown): void {
 /** Spawn a child with PTY or pipes. Throws if PTY requested but unavailable. */
 export function spawnChild(opts: SpawnOptions): SpawnedChild {
 	if (opts.tty) {
-		loadPty();
 		if (!ptyModule) {
 			throw new Error(
 				`tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +

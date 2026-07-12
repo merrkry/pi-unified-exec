@@ -55,3 +55,28 @@ jobs:
           # All matrix platforms have node-pty prebuilds; a load failure
           # must be a red build, not a silent skip of the PTY suite.
           EXPECT_PTY: "1"
+
+  test-bun-rejected:
+    name: Reject unsupported Bun runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Assert PTY module rejects Bun
+        shell: bash
+        run: |
+          set +e
+          output=$(bun -e 'await import("./src/pty.ts")' 2>&1)
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -F "Bun runtime" <<<"$output"
+          grep -F "is unsupported" <<<"$output"
