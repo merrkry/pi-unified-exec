@@ -184,6 +184,22 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 		}
 	});
 
+	it("Ctrl-D (\\x04) remains PTY input and sends EOF", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		try {
+			const r1 = await h.call("exec_command", { cmd: "cat", tty: true, yield_time_ms: 300 });
+			const sid = r1.details.session_id;
+			assert.ok(typeof sid === "number");
+
+			const r2 = await h.call("write_stdin", { session_id: sid, chars: "\x04", yield_time_ms: 1000 });
+			assert.equal(r2.details.session_id, undefined, `Ctrl-D did not stop cat: ${JSON.stringify(r2.details)}`);
+			assert.equal(r2.details.exit_code, 0, JSON.stringify(r2.details));
+		} finally {
+			await h.emit("session_shutdown");
+		}
+	});
+
 	it("Ctrl-C (\\x03) interrupts a PTY loop", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
@@ -202,11 +218,29 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 				chars: "\x03",
 				yield_time_ms: 1000,
 			});
-			// Session should exit (bash gets SIGINT from terminal).
-			if (r2.details.session_id !== undefined) {
-				// Some shells ignore SIGINT for background; fall back to kill.
-				await h.call("kill_session", { session_id: sid });
-			}
+			// Session must exit: silently falling back to kill would mask a PTY
+			// backend that echoes ^C without delivering SIGINT to the process group.
+			assert.equal(r2.details.session_id, undefined, `Ctrl-C did not stop session: ${JSON.stringify(r2.details)}`);
+		} finally {
+			await h.emit("session_shutdown");
+		}
+	});
+
+	it("Ctrl-\\ (\\x1c) terminates a PTY process with SIGQUIT", { skip: IS_WINDOWS }, async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		try {
+			const r1 = await h.call("exec_command", {
+				cmd: "exec sleep 60",
+				tty: true,
+				yield_time_ms: 300,
+			});
+			const sid = r1.details.session_id;
+			assert.ok(typeof sid === "number");
+
+			const r2 = await h.call("write_stdin", { session_id: sid, chars: "\x1c", yield_time_ms: 1000 });
+			assert.equal(r2.details.session_id, undefined, `Ctrl-\\ did not stop session: ${JSON.stringify(r2.details)}`);
+			assert.equal(r2.details.signal, "SIGQUIT", JSON.stringify(r2.details));
 		} finally {
 			await h.emit("session_shutdown");
 		}

@@ -13,7 +13,8 @@
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { disposeWindowsConpty, getPtyLoadError, isPtyAvailable } from "../src/pty.ts";
+import { disposeWindowsConpty, getPtyLoadError, isPtyAvailable, spawnChild } from "../src/pty.ts";
+import { IS_WINDOWS } from "../src/shell.ts";
 
 describe("PTY module loading", () => {
 	it("loads when EXPECT_PTY=1", { skip: process.env.EXPECT_PTY !== "1" }, () => {
@@ -25,6 +26,38 @@ describe("PTY module loading", () => {
 			assert.equal(getPtyLoadError(), undefined);
 		} else {
 			assert.match(getPtyLoadError() ?? "", /node-pty-prebuilt-multiarch/);
+		}
+	});
+});
+
+describe("PTY resize", () => {
+	it("delivers SIGWINCH after changing dimensions", { skip: IS_WINDOWS }, async () => {
+		const child = spawnChild({
+			command: ["bash", "-c", "trap 'echo WINCH; exit 0' WINCH; echo READY; while :; do sleep 1; done"],
+			cwd: process.cwd(),
+			env: process.env,
+			tty: true,
+		});
+		let output = "";
+		const decoder = new TextDecoder();
+		const done = new Promise<void>((resolve, reject) => {
+			const timeout = setTimeout(() => reject(new Error(`resize timed out; output=${JSON.stringify(output)}`)), 3000);
+			child.onData((chunk) => {
+				output += decoder.decode(chunk, { stream: true });
+				if (output.includes("READY")) child.resize(100, 40);
+			});
+			child.onExit((_code, _signal, failure) => {
+				clearTimeout(timeout);
+				if (failure) reject(new Error(failure));
+				else resolve();
+			});
+		});
+
+		try {
+			await done;
+			assert.match(output, /WINCH/);
+		} finally {
+			child.kill("SIGKILL");
 		}
 	});
 });
