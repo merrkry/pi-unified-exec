@@ -10,6 +10,7 @@ All notable changes to this project. **Newest entries go on top.**
 
 ### Changed
 
+- Declare an explicit pnpm build-script policy: allow the audited node-pty prebuild check while denying unrelated transitive lifecycle scripts, so Pi can install this Git package with strict dependency-build checks enabled.
 - Fail extension loading with a clear diagnostic under Bun instead of loading a Node native addon that may appear to initialize but produces no PTY data or exits with `SIGHUP`. This temporary production branch requires Node.js 22.19 or newer.
 
 ## 2026-07-10 — 0.6.1
