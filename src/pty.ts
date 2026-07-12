@@ -257,7 +257,17 @@ function spawnBunPty(bun: BunRuntime, opts: SpawnOptions): SpawnedChild {
 			}
 		},
 	});
-	const child = bun.spawn(opts.command, {
+	let command = opts.command;
+	if (IS_WINDOWS && opts.windowsVerbatimArguments) {
+		// buildShellCommand pre-quotes cmd.exe's /c payload for node-pty's raw
+		// command-line mode. Bun.spawn accepts argv and performs its own quoting,
+		// so passing those wrapper quotes would make them part of the command.
+		const last = command.at(-1);
+		if (last?.startsWith('"') && last.endsWith('"')) {
+			command = [...command.slice(0, -1), last.slice(1, -1)];
+		}
+	}
+	const child = bun.spawn(command, {
 		cwd: opts.cwd,
 		env: opts.env,
 		terminal,

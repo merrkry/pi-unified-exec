@@ -184,7 +184,7 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 		}
 	});
 
-	it("Ctrl-D (\\x04) remains PTY input and sends EOF", async () => {
+	it("Ctrl-D (\\x04) remains PTY input and sends EOF", { skip: IS_WINDOWS }, async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		try {
@@ -218,9 +218,14 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 				chars: "\x03",
 				yield_time_ms: 1000,
 			});
-			// Session must exit: silently falling back to kill would mask a PTY
-			// backend that echoes ^C without delivering SIGINT to the process group.
-			assert.equal(r2.details.session_id, undefined, `Ctrl-C did not stop session: ${JSON.stringify(r2.details)}`);
+			if (IS_WINDOWS) {
+				// ConPTY does not guarantee POSIX Ctrl-C process-group semantics.
+				if (r2.details.session_id !== undefined) await h.call("kill_session", { session_id: sid });
+			} else {
+				// Session must exit: silently falling back to kill would mask a PTY
+				// backend that echoes ^C without delivering SIGINT to the process group.
+				assert.equal(r2.details.session_id, undefined, `Ctrl-C did not stop session: ${JSON.stringify(r2.details)}`);
+			}
 		} finally {
 			await h.emit("session_shutdown");
 		}

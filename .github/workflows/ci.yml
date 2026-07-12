@@ -74,7 +74,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Test PTY loader
+        run: bun test tests/pty-load.test.ts
+        env:
+          EXPECT_PTY: "1"
+
       - name: Test PTY backend
-        run: bun test tests/pty-load.test.ts tests/e2e-pty.test.ts
+        run: bun test tests/e2e-pty.test.ts
         env:
           EXPECT_PTY: "1"
