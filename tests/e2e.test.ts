@@ -106,7 +106,8 @@ describe("unified-exec e2e", () => {
 	it("resolveMaxEmptyPollMs reads the empty-poll cap env var", () => {
 		assert.equal(resolveMaxEmptyPollMs({}), 1_800_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
-		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "500" }), 1_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "2000000" }), 1_800_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 1_800_000);
 	});
 
@@ -160,10 +161,10 @@ describe("unified-exec e2e", () => {
 	it("process that exits BETWEEN calls is still drainable via write_stdin", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		// 3 ticks @ 200ms = 600ms runtime. Yield at 250ms -> session_id returned.
-		// Then wait 800ms so the process exits, then poll.
+		// 3 ticks @ 500ms = 1.5s runtime. The requested 250ms yield clamps to
+		// 1s, so a session_id is returned. Then wait for exit before polling.
 		const r1 = await h.call("exec_command", {
-			cmd: "for i in 1 2 3; do echo tock $i; sleep 0.2; done",
+			cmd: "for i in 1 2 3; do echo tock $i; sleep 0.5; done",
 			yield_time_ms: 250,
 		});
 		assert.ok(
@@ -172,7 +173,7 @@ describe("unified-exec e2e", () => {
 		);
 		const sid = r1.details.session_id;
 
-		// Wait for the process to definitely exit (600ms runtime - 250ms yield + slack).
+		// Wait for the process to definitely exit (1.5s runtime - 1s yield + slack).
 		await new Promise((r) => setTimeout(r, 800));
 
 		// Now poll — process has already exited, but the store should still have
@@ -195,7 +196,7 @@ describe("unified-exec e2e", () => {
 		try {
 			await h.emit("session_start");
 			const r1 = await h.call("exec_command", {
-				cmd: "sleep 0.4",
+				cmd: "sleep 1.2",
 				yield_time_ms: 250,
 			});
 			assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
@@ -225,7 +226,7 @@ describe("unified-exec e2e", () => {
 		try {
 			await h.emit("session_start");
 			const r1 = await h.call("exec_command", {
-				cmd: "sleep 0.4",
+				cmd: "sleep 1.2",
 				yield_time_ms: 250,
 			});
 			assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
@@ -402,13 +403,12 @@ describe("unified-exec e2e", () => {
 	it("running-session footer clears automatically when a background process exits", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const r1 = await h.call("exec_command", { cmd: "sleep 0.4", yield_time_ms: 250 });
+		const r1 = await h.call("exec_command", { cmd: "sleep 1.2", yield_time_ms: 250 });
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
 		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
 
-		// Poll, don't fixed-sleep: `sleep 0.4` can take >700ms wall time on a
-		// loaded CI runner (observed on windows-latest).
+		// Poll instead of fixed-sleep; loaded CI runners can delay process exit.
 		assert.ok(
 			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === undefined),
 			`status did not clear: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
@@ -423,7 +423,7 @@ describe("unified-exec e2e", () => {
 	it("post-tree running-session widget clears automatically when the process exits", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const r1 = await h.call("exec_command", { cmd: "sleep 0.4", yield_time_ms: 250 });
+		const r1 = await h.call("exec_command", { cmd: "sleep 1.2", yield_time_ms: 250 });
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
 
@@ -444,7 +444,7 @@ describe("unified-exec e2e", () => {
 	it("running-session UI decrements when one of multiple sessions exits", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const short = await h.call("exec_command", { cmd: "sleep 1.2", yield_time_ms: 250 });
+		const short = await h.call("exec_command", { cmd: "sleep 3", yield_time_ms: 250 });
 		const long = await h.call("exec_command", { cmd: "sleep 10", yield_time_ms: 250 });
 		const shortSid = short.details.session_id;
 		const longSid = long.details.session_id;
@@ -454,7 +454,7 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
 		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 2 sessions running");
 
-		// Poll for the short session's exit instead of a fixed 1.1s sleep.
+		// Poll for the short session's exit instead of using a fixed sleep.
 		assert.ok(
 			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === "unified-exec: 1 session running"),
 			`status did not decrement: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
@@ -483,7 +483,7 @@ describe("unified-exec e2e", () => {
 
 	it("session_shutdown racing exec_command creation does not orphan the child", async () => {
 		// Regression: exec_command inserts into the store only AFTER the
-		// 150ms early-exit grace; a shutdown inside that window used to drain
+		// 500ms early-exit grace; a shutdown inside that window used to drain
 		// the store without seeing the new session, leaving the process alive
 		// and untracked.
 		const h = makeHarness();
@@ -761,7 +761,7 @@ describe("unified-exec e2e", () => {
 	it("list_sessions reports just-exited sessions once with exit info, then removes them", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const r1 = await h.call("exec_command", { cmd: "sleep 0.3", yield_time_ms: 250 });
+		const r1 = await h.call("exec_command", { cmd: "sleep 1.2", yield_time_ms: 250 });
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number", JSON.stringify(r1.details));
 		await new Promise((r) => setTimeout(r, 600));

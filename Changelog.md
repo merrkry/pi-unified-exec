@@ -10,6 +10,7 @@ All notable changes to this project. **Newest entries go on top.**
 
 ### Changed
 
+- Simplify yield timing across platforms: commands now use a 5-second default, all yields are clamped to 1 second–30 minutes, and the early-exit grace is 500 ms. Agent guidance now recommends omitting the default, using 1 second only for interactive work, and polling long-running jobs once for at least 5 minutes.
 - Declare an explicit pnpm build-script policy: allow the audited node-pty prebuild check while denying unrelated transitive lifecycle scripts, so Pi can install this Git package with strict dependency-build checks enabled.
 - Fail extension loading with a clear diagnostic under Bun instead of loading a Node native addon that may appear to initialize but produces no PTY data or exits with `SIGHUP`. This temporary production branch requires Node.js 22.19 or newer.
 

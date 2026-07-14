@@ -46,14 +46,12 @@ import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------
 
-const MIN_YIELD_TIME_MS = 250;
-const MAX_YIELD_TIME_MS = 30_000;
-const MIN_EMPTY_YIELD_TIME_MS = 5_000;
-const DEFAULT_MAX_BACKGROUND_POLL_MS = 1_800_000;
+const MIN_YIELD_TIME_MS = 1_000;
+const MAX_YIELD_TIME_MS = 1_800_000;
+const DEFAULT_MAX_BACKGROUND_POLL_MS = MAX_YIELD_TIME_MS;
 export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
-const DEFAULT_EXEC_YIELD_MS = 10_000;
-const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
-const EARLY_EXIT_GRACE_PERIOD_MS = 150;
+const DEFAULT_YIELD_MS = 5_000;
+const EARLY_EXIT_GRACE_PERIOD_MS = 500;
 const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
@@ -77,12 +75,12 @@ export function resolveMaxEmptyPollMs(env: NodeJS.ProcessEnv = process.env): num
 
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_BACKGROUND_POLL_MS;
-	return Math.max(MIN_EMPTY_YIELD_TIME_MS, Math.floor(parsed));
+	return clamp(Math.floor(parsed), MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
 }
 
 function clampEmptyPollYield(ms: number | undefined): number {
-	const v = typeof ms === "number" && ms > 0 ? ms : DEFAULT_WRITE_STDIN_YIELD_MS;
-	return clamp(Math.floor(v), MIN_EMPTY_YIELD_TIME_MS, resolveMaxEmptyPollMs());
+	const v = typeof ms === "number" && ms > 0 ? ms : DEFAULT_YIELD_MS;
+	return clamp(Math.floor(v), MIN_YIELD_TIME_MS, resolveMaxEmptyPollMs());
 }
 
 /**
@@ -286,7 +284,7 @@ async function runExecCommand(
 	}
 	const shellCommand = buildShellCommand(shellBin, args.cmd);
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
-	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_EXEC_YIELD_MS);
+	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_YIELD_MS);
 
 	const id = ctx.store.allocateId();
 	const session = ExecSession.spawn(id, {
@@ -320,7 +318,7 @@ async function runExecCommand(
 	// be able to terminate children that are still inside the grace window.
 	ctx.pendingSessions.add(session);
 	try {
-	// Early-exit grace: if the process dies within 150 ms, treat it as a
+	// Early-exit grace: if the process dies within 500 ms, treat it as a
 	// short-lived command and never register it.
 	const start = Date.now();
 	const earlyDeadline = start + EARLY_EXIT_GRACE_PERIOD_MS;
@@ -443,7 +441,7 @@ async function runWriteStdin(
 	}
 	const writeBytes = resolveWriteInput(args);
 	const isEmptyPoll = writeBytes === undefined || writeBytes.length === 0;
-	const yieldTimeMs = isEmptyPoll ? clampEmptyPollYield(args.yield_time_ms) : clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
+	const yieldTimeMs = isEmptyPoll ? clampEmptyPollYield(args.yield_time_ms) : clampYield(args.yield_time_ms, DEFAULT_YIELD_MS);
 
 	const start = Date.now();
 	session.touch();
@@ -924,8 +922,8 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
-			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
-			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 30 minutes; set ${MAX_EMPTY_POLL_ENV_VAR}=300000 for cache-sensitive runs) rather than repeated short polls.`,
+			"Normally omit yield_time_ms and keep the 5s default. Use 1s only for interactive commands that may need prompt input.",
+			"For long-running non-interactive commands, avoid repeated short polls; after receiving a session_id, use one empty write_stdin poll of 5 minutes or longer.",
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -939,7 +937,7 @@ export default function (pi: ExtensionAPI) {
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false (plain pipes)." })),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_EXEC_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}].`,
+					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}].`,
 				}),
 			),
 		}),
@@ -963,10 +961,8 @@ export default function (pi: ExtensionAPI) {
 			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary.",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
-			`For known long-running non-interactive jobs, avoid frequent polling. After exec_command returns a session_id, use write_stdin with no chars/chars_b64 and a long yield_time_ms up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 30 minutes).`,
-			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; for prompt-cache-sensitive runs, set ${MAX_EMPTY_POLL_ENV_VAR}=300000 to keep polls within typical 5-minute cache expiry windows.`,
-			"Use long empty polls for builds, test suites, installs, downloads, data processing, and other jobs that do not need interaction.",
-			"Do not use long polls for interactive sessions such as REPLs, sudo, ssh, password prompts, or commands where you may need to send input soon.",
+			"Normally omit yield_time_ms and keep the 5s default. Use 1s only for interactive sessions that may need prompt input.",
+			"For long-running non-interactive jobs, use one empty poll of 5 minutes or longer instead of repeated short polls.",
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
@@ -985,7 +981,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}].`,
+					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}].`,
 				}),
 			),
 		}),
